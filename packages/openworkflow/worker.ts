@@ -8,6 +8,9 @@ import { randomUUID } from "node:crypto";
 const DEFAULT_LEASE_DURATION_MS = 30 * 1000; // 30s
 const DEFAULT_POLL_INTERVAL_MS = 100; // 100ms
 const DEFAULT_CONCURRENCY = 1;
+const MAX_ERROR_BACKOFF_MS = 30 * 1000; // 30s
+const RECONNECT_AFTER_ERRORS = 8; // ~25s cumulative backoff before first reconnect
+const MAX_HEARTBEAT_FAILURES = 3; // stop heartbeating after 3 consecutive failures
 
 /**
  * Configures how a Worker polls the backend, leases workflow runs, and
@@ -105,18 +108,60 @@ export class Worker {
   /*
    * Main run loop that continuously ticks while the worker is running.
    * Only sleeps when no work was claimed to avoid busy-waiting.
+   * Uses exponential backoff on consecutive errors to avoid hammering
+   * a failing database (e.g., during PostgreSQL restarts).
    */
   private async runLoop(): Promise<void> {
+    let consecutiveErrors = 0;
+
     while (this.running) {
       try {
         const claimedCount = await this.tick();
+
+        if (consecutiveErrors > 0) {
+          console.log(
+            `Worker recovered after ${consecutiveErrors} consecutive error(s)`,
+          );
+          consecutiveErrors = 0;
+        }
+
         // only sleep if we didn't claim any work
         if (claimedCount === 0) {
           await sleep(DEFAULT_POLL_INTERVAL_MS);
         }
       } catch (error) {
-        console.error("Worker tick failed:", error);
-        await sleep(DEFAULT_POLL_INTERVAL_MS);
+        consecutiveErrors++;
+        const backoffMs = Math.min(
+          DEFAULT_POLL_INTERVAL_MS * Math.pow(2, consecutiveErrors - 1),
+          MAX_ERROR_BACKOFF_MS,
+        );
+        console.error(
+          `Worker tick failed (attempt ${consecutiveErrors}, backoff ${backoffMs}ms):`,
+          error,
+        );
+
+        // After sustained failures, attempt to recreate the connection pool.
+        // This handles cases where the pool is permanently broken (e.g., all
+        // connections died during a database restart and the library cannot
+        // recover on its own).
+        if (
+          consecutiveErrors >= RECONNECT_AFTER_ERRORS &&
+          consecutiveErrors % RECONNECT_AFTER_ERRORS === 0 &&
+          this.backend.reconnect
+        ) {
+          try {
+            console.log("Attempting connection pool recreation...");
+            await this.backend.reconnect();
+            console.log("Connection pool recreated successfully");
+          } catch (reconnectError) {
+            console.error(
+              "Failed to recreate connection pool:",
+              reconnectError,
+            );
+          }
+        }
+
+        await sleep(backoffMs);
       }
     }
   }
@@ -225,6 +270,7 @@ class WorkflowExecution {
   workflowRun: WorkflowRun;
   workerId: string;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private consecutiveHeartbeatFailures = 0;
 
   constructor(options: WorkflowExecutionOptions) {
     this.backend = options.backend;
@@ -234,21 +280,39 @@ class WorkflowExecution {
 
   /**
    * Start the heartbeat loop for this execution, heartbeating at half the lease
-   * duration.
+   * duration. Stops heartbeating after MAX_HEARTBEAT_FAILURES consecutive
+   * failures to avoid hammering a dead connection pool.
    */
   startHeartbeat(): void {
     const leaseDurationMs = DEFAULT_LEASE_DURATION_MS;
     const heartbeatIntervalMs = leaseDurationMs / 2;
 
     this.heartbeatTimer = setInterval(() => {
+      if (this.consecutiveHeartbeatFailures >= MAX_HEARTBEAT_FAILURES) {
+        // Stop heartbeating — the lease will expire and another worker can
+        // reclaim the run when the database recovers.
+        this.stopHeartbeat();
+        console.error(
+          `Heartbeat for run ${this.workflowRun.id} stopped after ${MAX_HEARTBEAT_FAILURES} consecutive failures`,
+        );
+        return;
+      }
+
       this.backend
         .extendWorkflowRunLease({
           workflowRunId: this.workflowRun.id,
           workerId: this.workerId,
           leaseDurationMs,
         })
+        .then(() => {
+          this.consecutiveHeartbeatFailures = 0;
+        })
         .catch((error: unknown) => {
-          console.error("Heartbeat failed:", error);
+          this.consecutiveHeartbeatFailures++;
+          console.error(
+            `Heartbeat failed for run ${this.workflowRun.id} (${this.consecutiveHeartbeatFailures}/${MAX_HEARTBEAT_FAILURES}):`,
+            error,
+          );
         });
     }, heartbeatIntervalMs);
   }

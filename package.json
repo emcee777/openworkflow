@@ -28,7 +28,13 @@
     "worker": "npx @openworkflow/cli worker start"
   },
   "dependencies": {
-    "openworkflow": "*"
+    "@google/generative-ai": "^0.24.1",
+    "@types/pg": "^8.16.0",
+    "groq-sdk": "^0.37.0",
+    "openai": "^6.17.0",
+    "openworkflow": "*",
+    "pg": "^8.18.0",
+    "yaml": "^2.8.2"
   },
   "devDependencies": {
     "@cspell/eslint-plugin": "^9.6.3",

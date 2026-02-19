@@ -41,11 +41,13 @@ interface BackendPostgresOptions {
  */
 export class BackendPostgres implements Backend {
   private pg: Postgres;
-  private namespaceId: string;
+  private readonly namespaceId: string;
+  private readonly url: string;
 
-  private constructor(pg: Postgres, namespaceId: string) {
+  private constructor(pg: Postgres, namespaceId: string, url: string) {
     this.pg = pg;
     this.namespaceId = namespaceId;
+    this.url = url;
   }
 
   /**
@@ -73,11 +75,38 @@ export class BackendPostgres implements Backend {
     }
 
     const pg = newPostgres(url);
-    return new BackendPostgres(pg, namespaceId);
+    return new BackendPostgres(pg, namespaceId, url);
   }
 
   async stop(): Promise<void> {
     await this.pg.end();
+  }
+
+  /**
+   * Check if the database connection is healthy.
+   * @returns true if a simple query succeeds, false otherwise
+   */
+  async healthCheck(): Promise<boolean> {
+    try {
+      await this.pg`SELECT 1`;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Terminate the current connection pool and create a new one. Use this to
+   * recover from permanently broken pool states (e.g., after a PostgreSQL
+   * restart where all pooled connections died).
+   */
+  async reconnect(): Promise<void> {
+    try {
+      await this.pg.end();
+    } catch {
+      // pool may already be in a broken state — ignore end() errors
+    }
+    this.pg = newPostgres(this.url);
   }
 
   async createWorkflowRun(

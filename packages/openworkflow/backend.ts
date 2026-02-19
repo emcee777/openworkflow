@@ -57,6 +57,10 @@ export interface Backend {
 
   // Lifecycle
   stop(): Promise<void>;
+
+  // Optional resilience methods — backends may implement these to support
+  // automatic recovery from connection failures (e.g., database restarts).
+  reconnect?(): Promise<void>;
 }
 
 export interface CreateWorkflowRunParams {
