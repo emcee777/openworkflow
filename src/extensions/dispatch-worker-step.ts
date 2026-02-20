@@ -91,6 +91,19 @@ const POLL_INTERVAL_MS = 10_000;
 /** Session name validation: alphanumeric, dashes, underscores */
 const SESSION_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 
+/** Cloud launchers available for rate-limit failover rotation */
+const CLOUD_LAUNCHERS = ["cpb", "cbb", "cmb", "clb", "c5b"];
+
+/** Rate-limit text patterns in tmux pane output (case-insensitive) */
+const RATE_LIMIT_RE =
+  /rate.?limit|capacity|exceeded|too many requests|429|overloaded|throttl/i;
+
+/** Max rate-limit retries across different accounts */
+const MAX_RATE_LIMIT_RETRIES = 3;
+
+/** Delay after dispatch before checking for rate-limit (seconds) */
+const RATE_LIMIT_CHECK_DELAY_MS = 35_000;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -352,110 +365,191 @@ export function createDispatchStep(
     }
 
     // -----------------------------------------------------------------------
-    // Phase 2: Dispatch
+    // Phase 2+3: Dispatch with rate-limit detection and auto-redispatch
     // -----------------------------------------------------------------------
 
     const isLocalLauncher = launcher in LOCAL_LAUNCHER_MODELS;
+    let activeLauncher = launcher;
+    let activeLauncherPath = launcherPath;
+    const triedLaunchers = new Set<string>([launcher]);
 
-    try {
-      if (isLocalLauncher) {
-        // Local model dispatch: runs synchronously via local-task-dispatch.sh
-        // No tmux session, no Claude Code init — just Ollama + 5 tools
+    if (isLocalLauncher) {
+      // Local model dispatch: no rate-limit risk, no retry needed
+      try {
         const model = LOCAL_LAUNCHER_MODELS[launcher];
         const completeDir = completeFile.substring(0, completeFile.lastIndexOf("/"));
         await sshExec(
-          `mkdir -p "${completeDir}" && ${launcherPath} --model ${model} --prompt-file "${promptPath}" --output-dir "/tmp/local-${sessionName}" --task-id "${sessionName}" && cp "/tmp/local-${sessionName}/COMPLETE.yaml" "${completeFile}"`,
-          300_000, // 5 min for local model execution
+          `mkdir -p "${completeDir}" && ${activeLauncherPath} --model ${model} --prompt-file "${promptPath}" --output-dir "/tmp/local-${sessionName}" --task-id "${sessionName}" && cp "/tmp/local-${sessionName}/COMPLETE.yaml" "${completeFile}"`,
+          300_000,
           `local-dispatch-${sessionName}`,
         );
         console.log(`[dispatch] Local dispatch complete: ${sessionName} (model=${model})`);
-      } else if (ritual) {
-        const owRunId = process.env.OW_RUN_ID ?? "ow-dispatch";
-        const contextFile = get<string>(input, "context_file") ?? "";
-        const contextArg = contextFile ? ` --context-file "${contextFile}"` : "";
-        await sshExec(
-          `OW_RUN_ID=${owRunId} ${DISPATCH_SCRIPT} "${sessionName}" "${promptPath}" ${launcherPath}${contextArg}`,
-          180_000, // 3 min for ~75s ritual + buffer
-          `dispatch-ritual-${sessionName}`,
+      } catch (error) {
+        console.error(
+          `[dispatch] Local dispatch failed for ${sessionName}: ${(error as Error).message.slice(0, 300)}`,
         );
-        console.log(`[dispatch] Ritual dispatch complete: ${sessionName}`);
-      } else {
-        console.log(`[dispatch] No-ritual dispatch: ${sessionName}`);
-
-        // Create tmux session with launcher
-        await sshExec(
-          `tmux new-session -d -s "${sessionName}" ${launcherPath}`,
-          30_000,
-          `create-session-${sessionName}`,
-        );
-
-        // Wait for Claude Code init
-        await sleep(20_000);
-
-        // Send dispatch message
-        const dispatchMsg = `Welcome to the team, brother. Read ${promptPath} and execute. Ask any questions. No quick hacks. If you hit any hiccups PAUSE and come ask me. After implementation, run extraction per session-end protocol.`;
-        await sshExec(
-          `tmux send-keys -t "${sessionName}" "${dispatchMsg}" Enter`,
-          30_000,
-          `send-prompt-${sessionName}`,
-        );
-
-        // Brief pause then confirm Enter (handles stuck input)
-        await sleep(3_000);
-        await sshExec(
-          `tmux send-keys -t "${sessionName}" Enter`,
-          10_000,
-          `confirm-${sessionName}`,
-        );
-
-        console.log(`[dispatch] No-ritual dispatch complete: ${sessionName}`);
+        return {
+          status: "ssh_failure",
+          complete_yaml: null,
+          escalation_content: (error as Error).message,
+          elapsed_seconds: elapsedSec(),
+          session_name: sessionName,
+          death_detected: false,
+        };
       }
-    } catch (error) {
-      console.error(
-        `[dispatch] Dispatch failed for ${sessionName}: ${(error as Error).message.slice(0, 300)}`,
-      );
-      return {
-        status: "ssh_failure",
-        complete_yaml: null,
-        escalation_content: (error as Error).message,
-        elapsed_seconds: elapsedSec(),
-        session_name: sessionName,
-        death_detected: false,
-      };
-    }
+    } else {
+      // Cloud dispatch with rate-limit retry loop
+      let dispatched = false;
 
-    // -----------------------------------------------------------------------
-    // Phase 3: Post-dispatch verification
-    // -----------------------------------------------------------------------
-
-    if (postDispatchVerify && !isLocalLauncher) {
-      await sleep(30_000);
-      try {
-        const paneContent = await sshExec(
-          `tmux capture-pane -t "${sessionName}" -p | tail -5`,
-          30_000,
-          `verify-${sessionName}`,
-        );
-        console.log(
-          `[dispatch] Post-verify ${sessionName}: ${paneContent.slice(0, 200)}`,
-        );
-
-        // If prompt appears stuck in input line, re-send Enter
-        if (paneContent.includes("Welcome to the team")) {
+      for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
+        if (attempt > 0) {
           console.log(
-            `[dispatch] Prompt may be stuck — re-sending Enter for ${sessionName}`,
-          );
-          await sshExec(
-            `tmux send-keys -t "${sessionName}" Enter`,
-            10_000,
-            `resend-enter-${sessionName}`,
+            `[dispatch] Rate-limit retry ${attempt}/${MAX_RATE_LIMIT_RETRIES} for ${sessionName} (launcher=${activeLauncher})`,
           );
         }
-      } catch (error) {
-        // Non-fatal — worker might still be initializing
-        console.warn(
-          `[dispatch] Post-verify warning for ${sessionName}: ${(error as Error).message.slice(0, 200)}`,
-        );
+
+        // --- Dispatch ---
+        try {
+          if (ritual) {
+            const owRunId = process.env.OW_RUN_ID ?? "ow-dispatch";
+            const contextFile = get<string>(input, "context_file") ?? "";
+            const contextArg = contextFile ? ` --context-file "${contextFile}"` : "";
+            await sshExec(
+              `OW_RUN_ID=${owRunId} ${DISPATCH_SCRIPT} "${sessionName}" "${promptPath}" ${activeLauncherPath}${contextArg}`,
+              180_000,
+              `dispatch-ritual-${sessionName}-attempt${attempt}`,
+            );
+            console.log(`[dispatch] Ritual dispatch complete: ${sessionName} (attempt ${attempt})`);
+          } else {
+            console.log(`[dispatch] No-ritual dispatch: ${sessionName}`);
+            await sshExec(
+              `tmux new-session -d -s "${sessionName}" ${activeLauncherPath}`,
+              30_000,
+              `create-session-${sessionName}`,
+            );
+            await sleep(20_000);
+            const dispatchMsg = `Welcome to the team, brother. Read ${promptPath} and execute. Ask any questions. No quick hacks. If you hit any hiccups PAUSE and come ask me. After implementation, run extraction per session-end protocol.`;
+            await sshExec(
+              `tmux send-keys -t "${sessionName}" "${dispatchMsg}" Enter`,
+              30_000,
+              `send-prompt-${sessionName}`,
+            );
+            await sleep(3_000);
+            await sshExec(
+              `tmux send-keys -t "${sessionName}" Enter`,
+              10_000,
+              `confirm-${sessionName}`,
+            );
+            console.log(`[dispatch] No-ritual dispatch complete: ${sessionName}`);
+          }
+        } catch (error) {
+          console.error(
+            `[dispatch] Dispatch failed for ${sessionName}: ${(error as Error).message.slice(0, 300)}`,
+          );
+          return {
+            status: "ssh_failure",
+            complete_yaml: null,
+            escalation_content: (error as Error).message,
+            elapsed_seconds: elapsedSec(),
+            session_name: sessionName,
+            death_detected: false,
+          };
+        }
+
+        // --- Post-dispatch: check for rate-limit ---
+        if (postDispatchVerify) {
+          await sleep(RATE_LIMIT_CHECK_DELAY_MS);
+          try {
+            const paneContent = await sshExec(
+              `tmux capture-pane -t "${sessionName}" -p -S -30 2>/dev/null || echo ""`,
+              30_000,
+              `verify-ratelimit-${sessionName}-attempt${attempt}`,
+            );
+            console.log(
+              `[dispatch] Post-verify ${sessionName}: ${paneContent.slice(0, 200)}`,
+            );
+
+            // Check for rate-limit patterns
+            if (RATE_LIMIT_RE.test(paneContent)) {
+              console.warn(
+                `[dispatch] RATE LIMIT detected for ${sessionName} on ${activeLauncher} — killing session`,
+              );
+
+              // Kill the rate-limited session
+              try {
+                await sshExec(
+                  `tmux kill-session -t "=${sessionName}" 2>/dev/null || true`,
+                  15_000,
+                  `kill-ratelimited-${sessionName}`,
+                );
+              } catch {
+                // Non-fatal — session may already be gone
+              }
+
+              // Find next available cloud launcher
+              const nextLauncher = CLOUD_LAUNCHERS.find(
+                (l) => !triedLaunchers.has(l),
+              );
+              if (!nextLauncher || attempt >= MAX_RATE_LIMIT_RETRIES) {
+                console.error(
+                  `[dispatch] All accounts exhausted or max retries reached for ${sessionName}. Tried: ${[...triedLaunchers].join(", ")}`,
+                );
+                return {
+                  status: "failed_to_start",
+                  complete_yaml: null,
+                  escalation_content: `Rate-limited on all tried accounts: ${[...triedLaunchers].join(", ")}`,
+                  elapsed_seconds: elapsedSec(),
+                  session_name: sessionName,
+                  death_detected: false,
+                };
+              }
+
+              // Switch to next launcher
+              activeLauncher = nextLauncher;
+              activeLauncherPath = LAUNCHERS[nextLauncher]!;
+              triedLaunchers.add(nextLauncher);
+              console.log(
+                `[dispatch] Switching to ${activeLauncher} for retry`,
+              );
+
+              // Brief cooldown before retry
+              await sleep(5_000);
+              continue; // Next iteration of retry loop
+            }
+
+            // If prompt appears stuck in input line, re-send Enter
+            if (paneContent.includes("Welcome to the team")) {
+              console.log(
+                `[dispatch] Prompt may be stuck — re-sending Enter for ${sessionName}`,
+              );
+              await sshExec(
+                `tmux send-keys -t "${sessionName}" Enter`,
+                10_000,
+                `resend-enter-${sessionName}`,
+              );
+            }
+          } catch (error) {
+            // Non-fatal — worker might still be initializing
+            console.warn(
+              `[dispatch] Post-verify warning for ${sessionName}: ${(error as Error).message.slice(0, 200)}`,
+            );
+          }
+        }
+
+        // Dispatch succeeded (no rate-limit detected)
+        dispatched = true;
+        break;
+      }
+
+      if (!dispatched) {
+        return {
+          status: "failed_to_start",
+          complete_yaml: null,
+          escalation_content: `Failed to dispatch after ${MAX_RATE_LIMIT_RETRIES} rate-limit retries`,
+          elapsed_seconds: elapsedSec(),
+          session_name: sessionName,
+          death_detected: false,
+        };
       }
     }
 
@@ -599,7 +693,41 @@ export function createDispatchStep(
       await sleep(POLL_INTERVAL_MS);
     }
 
-    // --- Timeout ---
+    // --- Timeout: final COMPLETE.yaml check before declaring timeout ---
+    // Worker may have finished in the last poll interval
+    try {
+      const finalCheck = await sshPoll(
+        `test -f "${completeFile}" && echo EXISTS || echo NO`,
+        30_000,
+      );
+      if (finalCheck.includes("EXISTS")) {
+        const content = await sshExec(
+          `cat "${completeFile}"`,
+          30_000,
+          `read-complete-pretimeout-${sessionName}`,
+        );
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = parseYaml(content) as Record<string, unknown>;
+        } catch {
+          parsed = { raw_content: content };
+        }
+        console.log(
+          `[dispatch] COMPLETE (pre-timeout): ${sessionName} (${elapsedSec().toFixed(0)}s)`,
+        );
+        return {
+          status: "completed",
+          complete_yaml: parsed,
+          escalation_content: null,
+          elapsed_seconds: elapsedSec(),
+          session_name: sessionName,
+          death_detected: false,
+        };
+      }
+    } catch {
+      // SSH failed — proceed with timeout
+    }
+
     console.log(
       `[dispatch] TIMEOUT: ${sessionName} after ${timeoutSeconds}s`,
     );

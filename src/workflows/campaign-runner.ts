@@ -471,13 +471,50 @@ async function watchAllWorkers(
 
       // Check per-worker timeout
       if (elapsed >= workerTimeout) {
-        console.log(`[campaign] TIMEOUT: ${worker.workerId}`);
-        results.push({
-          id: worker.workerId,
-          status: "timeout",
-          elapsed_seconds: elapsed / 1000,
-          complete_yaml: null,
-        });
+        // Final COMPLETE.yaml check before declaring timeout — worker may have
+        // finished in the last poll interval
+        let finalCompleted = false;
+        try {
+          const lastCheck = await sshPoll(
+            `test -f "${worker.completeFile}" && echo EXISTS || echo NO`,
+            15_000,
+          );
+          if (lastCheck.includes("EXISTS")) {
+            const content = await sshExec(
+              `cat "${worker.completeFile}"`,
+              30_000,
+              `read-complete-pretimeout-${worker.workerId}`,
+            );
+            let parsed: Record<string, unknown>;
+            try {
+              parsed = parseYaml(content) as Record<string, unknown>;
+            } catch {
+              parsed = { raw_content: content };
+            }
+            console.log(
+              `[campaign] COMPLETE (pre-timeout): ${worker.workerId} (${(elapsed / 1000).toFixed(0)}s)`,
+            );
+            results.push({
+              id: worker.workerId,
+              status: "completed",
+              elapsed_seconds: elapsed / 1000,
+              complete_yaml: parsed,
+            });
+            finalCompleted = true;
+          }
+        } catch {
+          // SSH failed — proceed with timeout
+        }
+
+        if (!finalCompleted) {
+          console.log(`[campaign] TIMEOUT: ${worker.workerId}`);
+          results.push({
+            id: worker.workerId,
+            status: "timeout",
+            elapsed_seconds: elapsed / 1000,
+            complete_yaml: null,
+          });
+        }
         pending.splice(i, 1);
         continue;
       }
