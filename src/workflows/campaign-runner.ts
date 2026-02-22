@@ -231,6 +231,25 @@ function sqlEsc(s: string): string {
 }
 
 /**
+ * Check worker_runs table for a session's completion status.
+ * Returns 'complete' if the worker_runs entry shows completion, null otherwise.
+ * Uses local psql — non-blocking, failure is non-fatal.
+ */
+async function checkWorkerRunsStatus(sessionName: string): Promise<string | null> {
+  try {
+    const dbName = process.env.DB_NAME || "hearth";
+    const result = await execAsync(
+      `/opt/homebrew/opt/postgresql@16/bin/psql -h localhost -U claude_daemon -d ${dbName} -t -A -c "SELECT status FROM public.worker_runs WHERE session_name = '${sessionName.replace(/'/g, "''")}' LIMIT 1"`,
+      10_000,
+    );
+    const status = result.trim();
+    return status || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fire-and-forget database update via local psql on Hearth.
  * Failures are logged but never block the workflow.
  */
@@ -553,6 +572,41 @@ async function watchAllWorkers(
         // SSH error during poll — try next cycle
       }
 
+      // Check worker_runs table (secondary completion signal)
+      {
+        const wrStatus = await checkWorkerRunsStatus(worker.sessionName);
+        if (wrStatus === "complete") {
+          console.log(
+            `[campaign] worker_runs shows complete for ${worker.workerId} — treating as done`,
+          );
+          let parsed: Record<string, unknown> = { source: "worker_runs", status: "complete" };
+          try {
+            const content = await sshExec(
+              `cat "${worker.completeFile}" 2>/dev/null || echo ""`,
+              30_000,
+              `read-complete-workerruns-${worker.workerId}`,
+            );
+            if (content) {
+              try {
+                parsed = parseYaml(content) as Record<string, unknown>;
+              } catch {
+                parsed = { raw_content: content };
+              }
+            }
+          } catch {
+            // Non-fatal
+          }
+          results.push({
+            id: worker.workerId,
+            status: "completed",
+            elapsed_seconds: elapsed / 1000,
+            complete_yaml: parsed,
+          });
+          pending.splice(i, 1);
+          continue;
+        }
+      }
+
       // Check for session death
       try {
         const alive = await sshPoll(
@@ -635,6 +689,206 @@ async function watchAllWorkers(
 }
 
 // ---------------------------------------------------------------------------
+// Per-Worker Watch: watch a single worker for COMPLETE.yaml
+// ---------------------------------------------------------------------------
+
+/**
+ * Watch a single dispatched worker for completion.
+ * Used as individual memoized steps in parallel phases so that on resume,
+ * only failed/timed-out workers re-execute (completed workers are skipped).
+ */
+async function watchSingleWorker(
+  dispatchInfo: DispatchInfo,
+  worker: CampaignWorker,
+): Promise<WorkerResult> {
+  const startTime = Date.now();
+
+  // Pre-completed workers return immediately
+  if (dispatchInfo.dispatchStatus === "pre_completed") {
+    return {
+      id: dispatchInfo.workerId,
+      status: "completed",
+      elapsed_seconds: 0,
+      complete_yaml: dispatchInfo.completeYaml ?? null,
+    };
+  }
+
+  // Failed dispatch
+  if (dispatchInfo.dispatchStatus === "dispatch_failed") {
+    return {
+      id: dispatchInfo.workerId,
+      status: "failed_to_start",
+      elapsed_seconds: 0,
+      complete_yaml: null,
+    };
+  }
+
+  // Poll for completion
+  const timeoutMs = worker.timeout * 1000;
+  console.log(
+    `[campaign] Watching ${dispatchInfo.workerId} (timeout: ${worker.timeout}s)`,
+  );
+
+  while (Date.now() - startTime < timeoutMs) {
+    const elapsed = Date.now() - startTime;
+
+    // Check COMPLETE.yaml
+    try {
+      const exists = await sshPoll(
+        `test -f "${dispatchInfo.completeFile}" && echo EXISTS || echo NO`,
+        30_000,
+      );
+      if (exists.includes("EXISTS")) {
+        const content = await sshExec(
+          `cat "${dispatchInfo.completeFile}"`,
+          30_000,
+          `read-complete-${dispatchInfo.workerId}`,
+        );
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = parseYaml(content) as Record<string, unknown>;
+        } catch {
+          parsed = { raw_content: content };
+        }
+        console.log(
+          `[campaign] COMPLETE: ${dispatchInfo.workerId} (${(elapsed / 1000).toFixed(0)}s)`,
+        );
+        return {
+          id: dispatchInfo.workerId,
+          status: "completed",
+          elapsed_seconds: elapsed / 1000,
+          complete_yaml: parsed,
+        };
+      }
+    } catch {
+      // SSH error — try next cycle
+    }
+
+    // Check worker_runs table (secondary completion signal)
+    {
+      const wrStatus = await checkWorkerRunsStatus(dispatchInfo.sessionName);
+      if (wrStatus === "complete") {
+        console.log(
+          `[campaign] worker_runs shows complete for ${dispatchInfo.workerId}`,
+        );
+        let parsed: Record<string, unknown> = { source: "worker_runs", status: "complete" };
+        try {
+          const content = await sshExec(
+            `cat "${dispatchInfo.completeFile}" 2>/dev/null || echo ""`,
+            30_000,
+            `read-complete-workerruns-${dispatchInfo.workerId}`,
+          );
+          if (content) {
+            try {
+              parsed = parseYaml(content) as Record<string, unknown>;
+            } catch {
+              parsed = { raw_content: content };
+            }
+          }
+        } catch {
+          // Non-fatal
+        }
+        return {
+          id: dispatchInfo.workerId,
+          status: "completed",
+          elapsed_seconds: elapsed / 1000,
+          complete_yaml: parsed,
+        };
+      }
+    }
+
+    // Check for session death
+    try {
+      const alive = await sshPoll(
+        `tmux has-session -t "=${dispatchInfo.sessionName}" 2>/dev/null && echo ALIVE || echo DEAD`,
+        15_000,
+      );
+      if (alive.includes("DEAD")) {
+        // Session died — final COMPLETE.yaml check
+        try {
+          const lastCheck = await sshPoll(
+            `test -f "${dispatchInfo.completeFile}" && echo EXISTS || echo NO`,
+            15_000,
+          );
+          if (lastCheck.includes("EXISTS")) {
+            const content = await sshExec(
+              `cat "${dispatchInfo.completeFile}"`,
+              30_000,
+              `read-complete-postdeath-${dispatchInfo.workerId}`,
+            );
+            let parsed: Record<string, unknown>;
+            try {
+              parsed = parseYaml(content) as Record<string, unknown>;
+            } catch {
+              parsed = { raw_content: content };
+            }
+            return {
+              id: dispatchInfo.workerId,
+              status: "completed",
+              elapsed_seconds: (Date.now() - startTime) / 1000,
+              complete_yaml: parsed,
+            };
+          }
+        } catch {
+          // Fall through
+        }
+
+        console.log(
+          `[campaign] DEATH: ${dispatchInfo.workerId} — no COMPLETE.yaml`,
+        );
+        return {
+          id: dispatchInfo.workerId,
+          status: "context_death",
+          elapsed_seconds: (Date.now() - startTime) / 1000,
+          complete_yaml: null,
+        };
+      }
+    } catch {
+      // SSH error — continue
+    }
+
+    await sleep(WATCH_POLL_INTERVAL_MS);
+  }
+
+  // Timeout — final check
+  try {
+    const finalCheck = await sshPoll(
+      `test -f "${dispatchInfo.completeFile}" && echo EXISTS || echo NO`,
+      15_000,
+    );
+    if (finalCheck.includes("EXISTS")) {
+      const content = await sshExec(
+        `cat "${dispatchInfo.completeFile}"`,
+        30_000,
+        `read-complete-pretimeout-${dispatchInfo.workerId}`,
+      );
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = parseYaml(content) as Record<string, unknown>;
+      } catch {
+        parsed = { raw_content: content };
+      }
+      return {
+        id: dispatchInfo.workerId,
+        status: "completed",
+        elapsed_seconds: (Date.now() - startTime) / 1000,
+        complete_yaml: parsed,
+      };
+    }
+  } catch {
+    // SSH failed
+  }
+
+  console.log(`[campaign] TIMEOUT: ${dispatchInfo.workerId}`);
+  return {
+    id: dispatchInfo.workerId,
+    status: "timeout",
+    elapsed_seconds: (Date.now() - startTime) / 1000,
+    complete_yaml: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Phase Execution
 // ---------------------------------------------------------------------------
 
@@ -696,7 +950,11 @@ async function executePhase(
       }
     }
   } else {
-    // --- Parallel: dispatch all workers, then watch for all COMPLETE files ---
+    // --- Parallel: dispatch all workers, then watch per-worker ---
+    // dispatch-all is one memoized step (idempotent — handles pre-existing sessions).
+    // Each worker gets its own watch step so that on resume, only failed/timed-out
+    // workers re-execute. This fixes the permanent-stuck bug where a monolithic
+    // watch-all step would cache timeout results and replay them forever.
 
     // Step: dispatch all workers (creates sessions, sends prompts, no waiting)
     const dispatched = await step.run(
@@ -704,13 +962,31 @@ async function executePhase(
       () => dispatchAllWorkers(phase.workers, campaignName),
     );
 
-    // Step: watch for all COMPLETE files
-    const watchResults = await step.run(
-      { name: `watch-all-${campaignName}-${phase.name}` },
-      () => watchAllWorkers(dispatched, phase.workers),
-    );
+    // Build a lookup from workerId → dispatch info
+    const dispatchMap = new Map<string, DispatchInfo>();
+    for (const d of dispatched) {
+      dispatchMap.set(d.workerId, d);
+    }
 
-    workerResults.push(...watchResults);
+    // Per-worker watch steps (each individually memoized)
+    for (const worker of phase.workers) {
+      const dInfo = dispatchMap.get(worker.id);
+      if (!dInfo) {
+        workerResults.push({
+          id: worker.id,
+          status: "failed_to_start",
+          elapsed_seconds: 0,
+          complete_yaml: null,
+        });
+        continue;
+      }
+
+      const watchResult = await step.run(
+        { name: `watch-${campaignName}-${worker.id}` },
+        () => watchSingleWorker(dInfo, worker),
+      );
+      workerResults.push(watchResult);
+    }
   }
 
   // --- Gate check (only if all workers completed) ---

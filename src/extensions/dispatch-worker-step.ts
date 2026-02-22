@@ -104,6 +104,19 @@ const MAX_RATE_LIMIT_RETRIES = 3;
 /** Delay after dispatch before checking for rate-limit (seconds) */
 const RATE_LIMIT_CHECK_DELAY_MS = 35_000;
 
+/** Exponential backoff delays between rate-limit retries (ms): 10s, 30s, 90s */
+const RATE_LIMIT_BACKOFF_MS = [10_000, 30_000, 90_000];
+
+/**
+ * In-memory cache of recently rate-limited launchers.
+ * Maps launcher name → timestamp when cooldown expires.
+ * Survives across dispatch calls within the same worker process.
+ */
+const rateLimitedUntil = new Map<string, number>();
+
+/** Cooldown duration for rate-limited launchers (5 minutes) */
+const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -201,6 +214,26 @@ async function sshPoll(cmd: string, timeoutMs: number): Promise<string> {
 /** Non-blocking sleep */
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Check worker_runs table for a session's completion status.
+ * Returns 'complete' if the worker_runs entry shows completion, null otherwise.
+ * Uses local psql (runs on Hearth where the DB is).
+ */
+async function checkWorkerRunsStatus(sessionName: string): Promise<string | null> {
+  try {
+    const dbName = process.env.DB_NAME || "hearth";
+    const result = await execAsync(
+      `/opt/homebrew/opt/postgresql@16/bin/psql -h localhost -U claude_daemon -d ${dbName} -t -A -c "SELECT status FROM public.worker_runs WHERE session_name = '${sessionName.replace(/'/g, "''")}' LIMIT 1"`,
+      10_000,
+    );
+    const status = result.trim();
+    return status || null;
+  } catch {
+    // DB query failure is non-fatal — continue relying on COMPLETE.yaml
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,11 +434,34 @@ export function createDispatchStep(
       // Cloud dispatch with rate-limit retry loop
       let dispatched = false;
 
+      // Pre-check: skip launchers known to be rate-limited
+      const now = Date.now();
+      if (rateLimitedUntil.has(activeLauncher) && rateLimitedUntil.get(activeLauncher)! > now) {
+        const remaining = Math.round((rateLimitedUntil.get(activeLauncher)! - now) / 1000);
+        console.log(
+          `[dispatch] Pre-check: ${activeLauncher} is rate-limited for ${remaining}s more — finding alternative`,
+        );
+        const altLauncher = CLOUD_LAUNCHERS.find(
+          (l) => !triedLaunchers.has(l) && (!rateLimitedUntil.has(l) || rateLimitedUntil.get(l)! <= now),
+        );
+        if (altLauncher) {
+          activeLauncher = altLauncher;
+          activeLauncherPath = LAUNCHERS[altLauncher]!;
+          triedLaunchers.add(altLauncher);
+          console.log(`[dispatch] Pre-check: switched to ${activeLauncher}`);
+        } else {
+          console.warn(`[dispatch] Pre-check: all known launchers rate-limited, proceeding with ${activeLauncher}`);
+        }
+      }
+
       for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
         if (attempt > 0) {
+          // Exponential backoff between rate-limit retries
+          const backoffMs = RATE_LIMIT_BACKOFF_MS[Math.min(attempt - 1, RATE_LIMIT_BACKOFF_MS.length - 1)];
           console.log(
-            `[dispatch] Rate-limit retry ${attempt}/${MAX_RATE_LIMIT_RETRIES} for ${sessionName} (launcher=${activeLauncher})`,
+            `[dispatch] Rate-limit retry ${attempt}/${MAX_RATE_LIMIT_RETRIES} for ${sessionName} (launcher=${activeLauncher}, backoff=${backoffMs / 1000}s)`,
           );
+          await sleep(backoffMs);
         }
 
         // --- Dispatch ---
@@ -475,6 +531,9 @@ export function createDispatchStep(
                 `[dispatch] RATE LIMIT detected for ${sessionName} on ${activeLauncher} — killing session`,
               );
 
+              // Record this launcher as rate-limited for future pre-checks
+              rateLimitedUntil.set(activeLauncher, Date.now() + RATE_LIMIT_COOLDOWN_MS);
+
               // Kill the rate-limited session
               try {
                 await sshExec(
@@ -486,8 +545,11 @@ export function createDispatchStep(
                 // Non-fatal — session may already be gone
               }
 
-              // Find next available cloud launcher
+              // Find next available cloud launcher (prefer non-rate-limited ones)
+              const nextNow = Date.now();
               const nextLauncher = CLOUD_LAUNCHERS.find(
+                (l) => !triedLaunchers.has(l) && (!rateLimitedUntil.has(l) || rateLimitedUntil.get(l)! <= nextNow),
+              ) ?? CLOUD_LAUNCHERS.find(
                 (l) => !triedLaunchers.has(l),
               );
               if (!nextLauncher || attempt >= MAX_RATE_LIMIT_RETRIES) {
@@ -512,8 +574,7 @@ export function createDispatchStep(
                 `[dispatch] Switching to ${activeLauncher} for retry`,
               );
 
-              // Brief cooldown before retry
-              await sleep(5_000);
+              // Backoff is handled at top of loop via RATE_LIMIT_BACKOFF_MS
               continue; // Next iteration of retry loop
             }
 
@@ -603,6 +664,58 @@ export function createDispatchStep(
         }
       } catch {
         // SSH failure during poll — continue to next iteration
+      }
+
+      // --- Check worker_runs table (secondary completion signal) ---
+      // If a worker wrote to worker_runs but failed to write COMPLETE.yaml,
+      // this catches the completion that would otherwise be missed.
+      {
+        const wrStatus = await checkWorkerRunsStatus(sessionName);
+        if (wrStatus === "complete") {
+          console.log(
+            `[dispatch] worker_runs shows complete for ${sessionName} — checking COMPLETE.yaml one more time`,
+          );
+          // Try to read COMPLETE.yaml (it may have been written after our last check)
+          try {
+            const content = await sshExec(
+              `cat "${completeFile}" 2>/dev/null || echo ""`,
+              30_000,
+              `read-complete-workerruns-${sessionName}`,
+            );
+            let parsed: Record<string, unknown>;
+            if (content) {
+              try {
+                parsed = parseYaml(content) as Record<string, unknown>;
+              } catch {
+                parsed = { raw_content: content };
+              }
+            } else {
+              parsed = { source: "worker_runs", status: "complete" };
+            }
+            console.log(
+              `[dispatch] COMPLETE (via worker_runs): ${sessionName} (${elapsedSec().toFixed(0)}s)`,
+            );
+            return {
+              status: "completed",
+              complete_yaml: parsed,
+              escalation_content: null,
+              elapsed_seconds: elapsedSec(),
+              session_name: sessionName,
+              death_detected: false,
+            };
+          } catch {
+            // COMPLETE.yaml read failed but worker_runs says complete —
+            // return completed with minimal info
+            return {
+              status: "completed",
+              complete_yaml: { source: "worker_runs", status: "complete" },
+              escalation_content: null,
+              elapsed_seconds: elapsedSec(),
+              session_name: sessionName,
+              death_detected: false,
+            };
+          }
+        }
       }
 
       // --- Check for ESCALATION.md ---
